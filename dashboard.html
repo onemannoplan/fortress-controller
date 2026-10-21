@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fortress Controller</title>
+<style>
+:root {
+	--bg: #f5f5f7; --panel: #fff; --text: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+	--accent: #0a66d8; --ok: #1a8f3c; --warn: #b26b00; --err: #c9302c; --code: #f0f0f3;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #1c1c1e; --panel: #2c2c2e; --text: #f2f2f7; --muted: #a1a1a6; --line: #3a3a3c;
+		--accent: #4c9bff; --ok: #3fc867; --warn: #f0a30a; --err: #ff5f57; --code: #1a1a1c;
+	}
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 13px -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; }
+nav { width: 170px; flex: none; border-right: 1px solid var(--line); padding: 12px 8px; display: flex; flex-direction: column; gap: 2px; }
+nav button { text-align: left; background: none; border: 0; color: var(--text); padding: 7px 10px; border-radius: 6px; font: inherit; cursor: pointer; }
+nav button.on { background: var(--accent); color: #fff; }
+nav .foot { margin-top: auto; color: var(--muted); font-size: 11px; padding: 6px 10px; }
+main { flex: 1; overflow: auto; padding: 16px 20px 40px; }
+h1 { font-size: 18px; margin: 0 0 12px; }
+h2 { font-size: 14px; margin: 0 0 8px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.grid .panel { margin: 0; }
+.row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .error, .err { color: var(--err); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+button.b { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+button.b:hover { border-color: var(--accent); }
+button.b.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.b.danger { color: var(--err); }
+button.b:disabled { opacity: .5; cursor: default; }
+input, select, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+textarea { width: 100%; min-height: 420px; font: 12px ui-monospace, Menlo, monospace; }
+pre { font: 12px ui-monospace, Menlo, monospace; background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; max-height: 520px; overflow: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 11px; }
+td.num { font-variant-numeric: tabular-nums; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.issue { padding: 6px 8px; border-radius: 6px; margin: 4px 0; background: var(--code); }
+.hidden { display: none; }
+#toast { position: fixed; right: 16px; bottom: 16px; max-width: 460px; display: flex; flex-direction: column; gap: 6px; }
+#toast div { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; box-shadow: 0 4px 16px rgba(0,0,0,.2); }
+#toast div.err { border-left-color: var(--err); color: var(--text); }
+</style>
+</head>
+<body>
+<nav id="nav">
+	<button data-tab="overview" class="on">Overview</button>
+	<button data-tab="services">Services</button>
+	<button data-tab="firewall">PF Firewall</button>
+	<button data-tab="lists">Blocklists &amp; Privoxy</button>
+	<button data-tab="logs">Logs</button>
+	<button data-tab="config">Config files</button>
+	<button data-tab="health">Health check</button>
+	<button data-tab="settings">Settings</button>
+	<div class="foot" id="updated">Loading…</div>
+</nav>
+<main>
+	<section id="tab-overview">
+		<h1>Overview</h1>
+		<div id="privBanner" class="panel hidden"></div>
+		<div class="panel"><h2>Problems</h2><div id="issues"></div></div>
+		<div class="panel">
+			<h2>Whole fortress</h2>
+			<div class="muted">Loads or unloads every macos-fortress component (port load/unload macos-fortress).</div>
+			<div class="row">
+				<button class="b" data-act="fortress reload">Reload everything</button>
+				<button class="b" data-act="fortress load">Load (start)</button>
+				<button class="b danger" data-act="fortress unload" data-confirm="Stop the whole fortress (PF firewall, Privoxy, blocklists)?">Unload (stop)</button>
+				<button class="b" data-act="update all">Update all blocklists</button>
+			</div>
+		</div>
+		<div class="grid" id="cards"></div>
+	</section>
+
+	<section id="tab-services" class="hidden">
+		<h1>Services (launchd jobs)</h1>
+		<div class="panel">
+			<div class="muted">Start/Stop load or unload the job and persist across reboots. Restart kills and relaunches it. Run now triggers a scheduled job immediately.</div>
+			<table><thead><tr><th>Job</th><th>State</th><th>PID</th><th>Last exit</th><th>Runs</th><th>Schedule</th><th></th></tr></thead><tbody id="svcRows"></tbody></table>
+		</div>
+		<div class="panel">
+			<h2>Related system services</h2>
+			<div class="row">Apache (serves proxy.pac on port 80) <button class="b" data-act="apache restart">Restart Apache</button></div>
+		</div>
+	</section>
+
+	<section id="tab-firewall" class="hidden">
+		<h1>PF Firewall</h1>
+		<div class="panel">
+			<div class="kv" id="pfKv"></div>
+			<div class="row">
+				<button class="b" data-act="pf reload">Reload pf.conf</button>
+				<button class="b" data-act="pf enable">Enable PF</button>
+				<button class="b danger" data-act="pf disable" data-confirm="Disable the PF firewall?">Disable PF</button>
+				<button class="b" data-act="pf reload-blockips">Reload blocklist tables</button>
+			</div>
+		</div>
+		<div class="panel">
+			<h2>Tables</h2>
+			<div class="muted">Hits = addresses in the table that have matched traffic (what pf_attacks.sh counts). bruteforce holds attackers caught by the SSH/web rate limits.</div>
+			<table><thead><tr><th>Table</th><th>Entries</th><th>Hits</th><th></th></tr></thead><tbody id="pfRows"></tbody></table>
+			<pre id="pfTableOut" class="hidden"></pre>
+		</div>
+		<div class="panel">
+			<h2>Addresses</h2>
+			<div class="row"><input id="ipIn" placeholder="IP address or CIDR" size="22">
+				<button class="b" id="ipTest">Test against all tables</button>
+				<button class="b" id="ipBlock">Block (add to bruteforce)</button>
+				<button class="b" id="ipUnblock">Remove from table</button>
+				<select id="ipTable"></select>
+			</div>
+			<div class="row">
+				<button class="b" data-act="pf expire-bruteforce">Expire bruteforce entries older than 7 days</button>
+				<button class="b danger" data-act="pf flush-bruteforce" data-confirm="Remove every address from the bruteforce table?">Flush bruteforce</button>
+			</div>
+			<pre id="ipOut" class="hidden"></pre>
+		</div>
+		<div class="panel">
+			<h2>Live blocked packets (pflog0)</h2>
+			<div class="row"><button class="b primary" id="pflogStart">Start</button><button class="b" id="pflogStop" disabled>Stop</button><input id="pflogFilter" placeholder="filter"></div>
+			<pre id="pflogOut"></pre>
+		</div>
+	</section>
+
+	<section id="tab-lists" class="hidden">
+		<h1>Blocklists &amp; Privoxy</h1>
+		<div class="panel">
+			<h2>Blocklist files</h2>
+			<table><thead><tr><th>List</th><th>Updated</th><th>Entries (lines)</th><th>Size</th><th>Path</th></tr></thead><tbody id="fileRows"></tbody></table>
+			<div class="row">
+				<button class="b" data-act="update dshield">Update DShield</button>
+				<button class="b" data-act="update emergingthreats">Update Emerging Threats</button>
+				<button class="b" data-act="update hosts">Update hosts list</button>
+				<button class="b" data-act="update adblock2privoxy">Update Adblock lists</button>
+				<button class="b primary" data-act="update all">Update all</button>
+				<button class="b danger" data-act="ab2p-reinit" data-confirm="Delete all generated adblock2privoxy rules and rebuild them from scratch?">Re-initialize adblock2privoxy</button>
+			</div>
+			<div class="muted">Updates run in the background; watch the fortress or adblock2privoxy log for progress.</div>
+		</div>
+		<div class="panel">
+			<h2>Privoxy</h2>
+			<div class="kv" id="privoxyKv"></div>
+			<div class="row">
+				<button class="b" data-act="privoxy filtering-on">Filtering on</button>
+				<button class="b" data-act="privoxy filtering-off">Filtering off</button>
+				<button class="b" data-act="privoxy restart">Restart Privoxy</button>
+				<button class="b" data-act="privoxy config-test">Test config</button>
+				<button class="b" data-act="privoxy expire-certs">Delete expired site certs</button>
+				<button class="b" data-act="privoxy clear-certs">Clear all site certs</button>
+			</div>
+			<h2 style="margin-top:12px">Privoxy log detail</h2>
+			<div class="row" id="debugBoxes"></div>
+			<div class="row"><button class="b" id="debugApply">Apply log levels</button></div>
+		</div>
+		<div class="panel">
+			<h2>Privoxy CA (HTTPS inspection)</h2>
+			<div class="kv" id="caKv"></div>
+			<div class="row">
+				<button class="b" data-act="ca trust">Trust CA in System keychain</button>
+				<button class="b danger" data-act="ca untrust" data-confirm="Remove trust for the Privoxy CA? HTTPS-inspected sites will show certificate errors.">Untrust CA</button>
+			</div>
+		</div>
+	</section>
+
+	<section id="tab-logs" class="hidden">
+		<h1>Logs</h1>
+		<div class="panel">
+			<div class="row">
+				<select id="logSel"></select>
+				<input id="logLines" type="number" value="500" min="10" max="20000" style="width:80px"> lines
+				<button class="b primary" id="logLoad">Load</button>
+				<button class="b" id="logFollow">Follow live</button>
+				<button class="b" id="logStop" disabled>Stop</button>
+				<input id="logFilter" placeholder="filter (text)">
+				<label><input type="checkbox" id="logNoise" checked> hide download progress</label>
+				<button class="b" id="logConsole">Open in Console</button>
+			</div>
+			<div class="muted" id="logDesc"></div>
+			<pre id="logOut"></pre>
+		</div>
+	</section>
+
+	<section id="tab-config" class="hidden">
+		<h1>Config files</h1>
+		<div class="panel">
+			<div class="row"><select id="cfgSel"></select><button class="b" id="cfgLoad">Load</button><button class="b primary" id="cfgSave" disabled>Validate &amp; save</button></div>
+			<div class="muted" id="cfgDesc"></div>
+			<div class="muted">Saving validates the file where possible (pfctl -n, privoxy --config-test, nginx -t, jsc) and keeps a backup in /opt/local/var/fortress-controller/backups.</div>
+			<textarea id="cfgText" spellcheck="false"></textarea>
+			<pre id="cfgOut" class="hidden"></pre>
+		</div>
+	</section>
+
+	<section id="tab-health" class="hidden">
+		<h1>Health check</h1>
+		<div class="panel">
+			<div class="row">
+				<button class="b primary" id="hcRun">Run macosfortress_setup_check.sh</button>
+				<button class="b" id="atkRun">Run pf_attacks.sh</button>
+			</div>
+			<div class="muted">Known false alarms in the port's check script: "Privoxy config http://p.p/" and "Blackhole server" always fail on macOS
+				(the script doesn't export http_proxy and doesn't accept the blackhole's self-signed cert), and block.txt.asc is never downloaded.
+				The Overview tab runs working versions of these checks.</div>
+			<pre id="hcOut"></pre>
+		</div>
+	</section>
+
+	<section id="tab-settings" class="hidden">
+		<h1>Settings</h1>
+		<div class="panel">
+			<div class="row">Check status every <input id="setPoll" type="number" min="15" max="3600" style="width:80px"> seconds</div>
+			<div class="row"><label><input type="checkbox" id="setNotify"> Notifications for new problems, fixes, blocked attackers and update errors</label></div>
+			<div class="row"><label><input type="checkbox" id="setLogin"> Start Fortress Controller at login</label></div>
+			<div class="row"><button class="b primary" id="setSave">Save</button><button class="b" id="setTestNotify">Send test notification</button></div>
+		</div>
+	</section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+window.__errors = [];
+window.addEventListener('error', e => window.__errors.push(e.message + ' @' + e.lineno));
+window.addEventListener('unhandledrejection', e => window.__errors.push('rejection: ' + e.reason));
+const FC = {
+	_id: 0, _p: {}, streams: {},
+	call(op, data = {}) {
+		return new Promise(res => {
+			const id = ++this._id;
+			this._p[id] = res;
+			window.webkit.messageHandlers.fc.postMessage(Object.assign({ op, id }, data));
+		});
+	},
+	_reply(id, v) { const r = this._p[id]; delete this._p[id]; if (r) r(v); },
+	onStatus(s) { renderStatus(s); },
+	streamData(id, text) { const s = this.streams[id]; if (s) s.data(text); },
+	streamEnd(id, code) { const s = this.streams[id]; if (s) { delete this.streams[id]; s.end(code); } },
+};
+const $ = id => document.getElementById(id);
+function el(tag, attrs, ...kids) {
+	const e = document.createElement(tag);
+	for (const [k, v] of Object.entries(attrs || {})) {
+		if (k === 'class') e.className = v;
+		else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+		else e.setAttribute(k, v);
+	}
+	for (const k of kids.flat()) if (k != null) e.append(k instanceof Node ? k : String(k));
+	return e;
+}
+function toast(msg, isErr) {
+	const d = el('div', { class: isErr ? 'err' : '' }, msg);
+	$('toast').append(d);
+	setTimeout(() => d.remove(), isErr ? 12000 : 5000);
+}
+const ctl = (args, interactive = true) => FC.call('ctl', { args, interactive });
+
+async function act(args, confirmMsg, btn) {
+	if (confirmMsg && !confirm(confirmMsg)) return;
+	if (btn) btn.disabled = true;
+	try {
+		const r = await ctl(args);
+		const text = ((r.out || '') + (r.err || '')).trim();
+		if (r.code === 0) toast('✓ ' + args.join(' ') + (text ? '\n' + text.slice(-1500) : ''));
+		else toast('✗ ' + args.join(' ') + ' (exit ' + r.code + ')\n' + text.slice(-1500), true);
+	} finally {
+		if (btn) btn.disabled = false;
+		FC.call('refresh');
+	}
+}
+document.addEventListener('click', e => {
+	const b = e.target.closest('[data-act]');
+	if (b) act(b.dataset.act.split(' '), b.dataset.confirm, b);
+});
+
+// ---- navigation
+document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => {
+	document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+	document.querySelectorAll('main section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + b.dataset.tab));
+}));
+
+// ---- formatting
+function age(t) {
+	if (!t) return 'never';
+	const s = Date.now() / 1000 - t;
+	if (s < 90) return Math.round(s) + 's ago';
+	if (s < 5400) return Math.round(s / 60) + 'm ago';
+	if (s < 172800) return Math.round(s / 3600) + 'h ago';
+	return Math.round(s / 86400) + 'd ago';
+}
+function size(n) {
+	if (n == null) return '—';
+	if (n < 1024) return n + ' B';
+	if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+	return (n / 1048576).toFixed(1) + ' MB';
+}
+const num = n => n == null ? '—' : Number(n).toLocaleString();
+// wget progress lines ("  3800K .......... ....") that fill the fortress log
+const isNoise = l => /^\s*\d+K( \.{10})+/.test(l);
+const okCode = c => /^[23]\d\d$/.test(c || '');
+function dot(state) { return el('span', { class: 'dot ' + state }); }
+function line(state, text) { return el('div', {}, dot(state), text); }
+function kv(target, pairs) {
+	const t = $(target); t.replaceChildren();
+	for (const [k, v] of pairs) t.append(el('div', {}, k), el('div', {}, v));
+}
+
+const SVC = {
+	'org.macports.macos-fortress': 'Master job: loads the PF and proxy components',
+	'org.macports.macos-fortress-pf': 'Loads pf.conf into the PF firewall at boot',
+	'org.macports.macos-fortress-pf.subports': 'Loads the DShield and Emerging Threats feed jobs',
+	'org.macports.macos-fortress-pf.brutexpire': 'Expires bruteforce table entries older than 7 days',
+	'org.macports.macos-fortress-dshield': 'Downloads the DShield IP blocklist into PF',
+	'org.macports.macos-fortress-emergingthreats': 'Downloads Emerging Threats IP lists into PF',
+	'org.macports.macos-fortress-hosts': 'Rebuilds the hosts blocklist from ~15 sources',
+	'org.macports.macos-fortress-proxy': 'Loads the hosts, Privoxy and adblock2privoxy jobs',
+	'org.macports.Privoxy': 'Filtering proxy on 127.0.0.1:8118',
+	'org.macports.Privoxy.delete-expired-certs': 'Deletes expired generated site certificates',
+	'org.macports.adblock2privoxy': 'Converts Adblock filter lists into Privoxy rules',
+	'org.macports.adblock2privoxy-nginx': 'Blackhole / element-hiding CSS server on 127.0.0.1:8119',
+};
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+function schedule(s) {
+	if (s.interval) {
+		const h = s.interval / 3600;
+		return 'every ' + (h >= 1 ? h.toFixed(h % 1 ? 1 : 0) + 'h' : Math.round(s.interval / 60) + 'm');
+	}
+	if (s.calendar) {
+		try {
+			let c = JSON.parse(s.calendar); if (!Array.isArray(c)) c = [c];
+			return c.map(x => (x.Weekday != null ? DAYS[x.Weekday] + ' ' : 'daily ') + String(x.Hour ?? 0).padStart(2, '0') + ':' + String(x.Minute ?? 0).padStart(2, '0')).join(', ');
+		} catch (e) { return s.calendar; }
+	}
+	return s.always_on ? 'always on' : '';
+}
+const btn = (label, args, opts = {}) => el('button', { class: 'b' + (opts.cls ? ' ' + opts.cls : ''), onclick: e => act(args, opts.confirm, e.target) }, label);
+
+// ---- status rendering
+let S = null, META = null;
+function renderStatus(s) {
+	if (!s || s.error) { $('updated').textContent = 'Status error: ' + (s && s.error || 'none'); return; }
+	S = s;
+	$('updated').textContent = 'Updated ' + new Date(s.time * 1000).toLocaleTimeString() + (s.root ? '' : ' (limited)');
+
+	const pb = $('privBanner');
+	pb.classList.toggle('hidden', !!s.root);
+	pb.replaceChildren(el('b', {}, 'Limited view. '),
+		'PF statistics, the Privoxy log and Privoxy settings need root. Install with the read-only sudo rule (install.sh) to see them without typing a password; actions will still ask for your password.');
+
+	// problems
+	const is = $('issues'); is.replaceChildren();
+	if (!s.issues.length) is.append(line('ok', 'No problems detected.'));
+	for (const i of s.issues) is.append(el('div', { class: 'issue' }, dot(i.level === 'error' ? 'err' : 'warn'), el('b', { class: i.level }, i.level === 'error' ? 'Error: ' : 'Warning: '), i.message));
+
+	// cards
+	const c = s.checks, cards = $('cards'); cards.replaceChildren();
+	const wifi = s.system_proxy.services;
+	cards.append(el('div', { class: 'panel' }, el('h2', {}, 'System proxy (what browsers use)'),
+		line(s.system_proxy.pac_enabled ? 'ok' : 'warn', s.system_proxy.pac_enabled ? 'On: ' + s.system_proxy.pac_url : 'Off: traffic bypasses the fortress'),
+		el('table', {}, el('tbody', {}, wifi.map(w => el('tr', {},
+			el('td', {}, w.name), el('td', {}, w.pac_enabled ? el('span', { class: 'ok' }, 'on') : el('span', { class: 'muted' }, 'off')),
+			el('td', {}, w.pac_enabled ? btn('Turn off', ['sysproxy', 'off', w.name]) : btn('Turn on', ['sysproxy', 'on', w.name], c.https_inspection && !okCode(c.https_inspection) ? { confirm: 'HTTPS inspection is currently failing, so most HTTPS sites will break with the proxy on. Turn it on anyway?' } : {}))))))));
+
+	cards.append(el('div', { class: 'panel' }, el('h2', {}, 'Privoxy proxy (127.0.0.1:8118)'),
+		line(s.listeners.privoxy && okCode(c.privoxy_http) ? 'ok' : 'err', 'Listening and answering: ' + (c.privoxy_http || 'no')),
+		line(c.block_http === '403' ? 'ok' : 'err', 'Blocks an ad host over HTTP: ' + (c.block_http === '403' ? 'yes' : 'no (' + c.block_http + ')')),
+		line(okCode(c.https_inspection) ? 'ok' : 'err', 'HTTPS inspection: ' + (okCode(c.https_inspection) ? 'working' : 'failing (' + c.https_inspection + ')')),
+		line(c.block_https === '403' ? 'ok' : 'warn', 'Blocks an ad host over HTTPS: ' + (c.block_https === '403' ? 'yes' : 'no (' + c.block_https + ')')),
+		line(okCode(c.passthrough_https) ? 'ok' : 'err', 'Non-inspected HTTPS (github.com): ' + (okCode(c.passthrough_https) ? 'working' : 'failing (' + c.passthrough_https + ')')),
+		s.privoxy ? line(s.privoxy.toggle === '0' ? 'warn' : 'ok', 'Filtering: ' + (s.privoxy.toggle === '0' ? 'toggled off' : 'on')) : null,
+		el('div', { class: 'row' }, btn('Restart Privoxy', ['privoxy', 'restart']))));
+
+	cards.append(el('div', { class: 'panel' }, el('h2', {}, 'PF firewall'),
+		s.pf ? [line(s.pf.enabled && s.pf.rules ? 'ok' : 'err', !s.pf.enabled ? 'Disabled' : s.pf.rules ? 'Enabled, ' + num(s.pf.rules) + ' rules' : 'Enabled but NO rules loaded: not filtering'),
+			el('div', {}, num(s.pf.tables.reduce((a, t) => a + (t.name === 'bruteforce' ? 0 : t.entries), 0)) + ' blocklisted addresses, ' + num(s.pf.attacks) + ' attack sources seen')]
+			: line('', 'Needs root to read (see banner)'),
+		line(s.interface.pf_int_if === s.interface.default_if ? 'ok' : 'warn', 'pf.conf interface ' + s.interface.pf_int_if + ', active ' + s.interface.default_if),
+		el('div', { class: 'row' }, btn('Reload PF', ['pf', 'reload']))));
+
+	const svcState = l => (s.services.find(x => x.label === l) || {}).state;
+	cards.append(el('div', { class: 'panel' }, el('h2', {}, 'Blackhole & PAC servers'),
+		line(okCode(c.blackhole_http) ? 'ok' : 'warn', 'nginx blackhole 127.0.0.1:8119: ' + (okCode(c.blackhole_http) ? 'answering' : 'not answering') + ' (' + svcState('org.macports.adblock2privoxy-nginx') + ')'),
+		line(okCode(c.pac_http) ? 'ok' : 'err', 'Apache serving proxy.pac: ' + (okCode(c.pac_http) ? 'yes' : 'no (' + c.pac_http + ')')),
+		el('div', { class: 'row' }, btn('Restart nginx', ['service', 'restart', 'org.macports.adblock2privoxy-nginx']), btn('Restart Apache', ['apache', 'restart']))));
+
+	const ca = s.privoxy_ca;
+	cards.append(el('div', { class: 'panel' }, el('h2', {}, 'HTTPS inspection CA'),
+		line(ca.trusted ? 'ok' : 'warn', 'Trusted in System keychain: ' + (ca.trusted ? 'yes' : 'no')),
+		line(ca.key_mode === '600' || ca.key_mode === '400' ? 'ok' : 'warn', 'CA private key mode: ' + ca.key_mode),
+		line(ca.trusted_cas_size > 0 ? 'ok' : 'err', 'Upstream trust bundle: ' + size(ca.trusted_cas_size)),
+		s.privoxy ? line(s.privoxy.ca_password_set ? 'ok' : 'err', 'ca-password set in Privoxy config: ' + (s.privoxy.ca_password_set ? 'yes' : 'no')) : null,
+		el('div', {}, 'Generated site certificates: ' + num(ca.cert_cache))));
+
+	const fl = s.fortress_log;
+	cards.append(el('div', { class: 'panel' }, el('h2', {}, 'Blocklist updates'),
+		s.files.slice(0, 7).map(f => line(f.mtime ? 'ok' : 'err', f.name + ': ' + age(f.mtime) + (f.lines != null ? ', ' + num(f.lines) + ' lines' : ''))),
+		fl.last_error ? el('div', { class: 'muted' }, 'Last error in fortress log: ' + fl.last_error) : null,
+		el('div', { class: 'row' }, btn('Update all', ['update', 'all']))));
+
+	// services
+	$('svcRows').replaceChildren(...s.services.map(v => {
+		const healthy = v.state === 'running' || (!v.always_on && v.state !== 'unloaded' && (v.last_exit === '0' || v.last_exit === '(never exited)'));
+		return el('tr', {},
+			el('td', {}, el('div', {}, v.label.replace('org.macports.', '')), el('div', { class: 'muted' }, SVC[v.label] || '')),
+			el('td', {}, dot(healthy ? 'ok' : (v.state === 'unloaded' || v.always_on ? 'err' : 'warn')), v.state + (v.disabled ? ' (disabled)' : '')),
+			el('td', { class: 'num' }, v.pid ?? ''), el('td', {}, v.last_exit || ''), el('td', { class: 'num' }, v.runs ?? ''),
+			el('td', {}, schedule(v)),
+			el('td', {}, el('div', { class: 'row' },
+				btn('Restart', ['service', 'restart', v.label]),
+				v.always_on ? null : btn('Run now', ['service', 'run', v.label]),
+				v.state === 'unloaded' ? btn('Start', ['service', 'start', v.label]) : btn('Stop', ['service', 'stop', v.label], { cls: 'danger', confirm: 'Stop and disable ' + v.label + '?' }))));
+	}));
+
+	// PF tab
+	if (s.pf) {
+		kv('pfKv', [['Status', s.pf.enabled ? 'Enabled' : 'Disabled'], ['Main ruleset rules', num(s.pf.rules)], ['blockips anchor rules', num(s.pf.anchor_rules)],
+			['State table entries', num(s.pf.states)], ['Attack sources (pf_attacks)', num(s.pf.attacks)], ['Interface', s.interface.pf_int_if]]);
+		$('pfRows').replaceChildren(...s.pf.tables.map(t => el('tr', {}, el('td', {}, t.name), el('td', { class: 'num' }, num(t.entries)), el('td', { class: 'num' }, num(t.hits)),
+			el('td', {}, el('button', { class: 'b', onclick: () => showTable(t.name) }, 'View entries')))));
+	} else {
+		kv('pfKv', [['Status', 'needs root (see Overview banner)']]);
+	}
+
+	// lists tab
+	$('fileRows').replaceChildren(...s.files.map(f => el('tr', {}, el('td', {}, f.name), el('td', {}, age(f.mtime)), el('td', { class: 'num' }, num(f.lines)), el('td', { class: 'num' }, size(f.size)), el('td', { class: 'muted' }, f.path))));
+	if (s.privoxy) {
+		kv('privoxyKv', [['Filtering', s.privoxy.toggle === '0' ? 'off' : 'on'], ['Debug levels', s.privoxy.debug.join(', ') || 'none (only fatal errors are logged)']]);
+		document.querySelectorAll('#debugBoxes input').forEach(i => { if (!i.dataset.touched) i.checked = s.privoxy.debug.includes(Number(i.value)); });
+	} else {
+		kv('privoxyKv', [['Settings', 'needs root to read']]);
+	}
+	kv('caKv', [['Trusted', ca.trusted ? 'yes' : 'no'], ['Key mode', ca.key_mode], ['trustedCAs.pem', size(ca.trusted_cas_size)], ['Site certificates', num(ca.cert_cache)]]);
+}
+
+// ---- PF helpers
+async function showTable(name) {
+	const out = $('pfTableOut'); out.classList.remove('hidden'); out.textContent = 'Loading ' + name + '…';
+	const r = await ctl(['ro', 'pf-table', name]);
+	const t = (r.out || '').trim();
+	out.textContent = name + ' (' + (t ? t.split('\n').length : 0) + ' entries)\n' + (t || r.err || '(empty)');
+}
+async function ipAction(args) {
+	const ip = $('ipIn').value.trim(); if (!ip) return;
+	const out = $('ipOut'); out.classList.remove('hidden'); out.textContent = '…';
+	const r = await ctl(args(ip));
+	out.textContent = ((r.out || '') + (r.err || '')).trim() || (r.code === 0 ? 'done' : 'exit ' + r.code);
+	FC.call('refresh');
+}
+$('ipTest').onclick = () => ipAction(ip => ['ro', 'pf-test', ip]);
+$('ipBlock').onclick = () => ipAction(ip => ['pf', 'block', ip]);
+$('ipUnblock').onclick = () => ipAction(ip => ['pf', 'unblock', ip, $('ipTable').value]);
+
+// ---- streaming (logs, pflog)
+function stream(args, out, filterInput, startBtn, stopBtn, max = 5000) {
+	let lines = [], partial = '';
+	const draw = () => {
+		const f = filterInput.value.toLowerCase(), quiet = out.id === 'logOut' && $('logNoise').checked;
+		out.textContent = lines.filter(l => !(quiet && isNoise(l)) && (!f || l.toLowerCase().includes(f))).join('\n');
+		out.scrollTop = out.scrollHeight;
+	};
+	filterInput.oninput = draw;
+	return FC.call('streamStart', { args }).then(id => {
+		startBtn.disabled = true; stopBtn.disabled = false;
+		out.textContent = '';
+		FC.streams[id] = {
+			data(text) {
+				const parts = (partial + text).split('\n'); partial = parts.pop();
+				lines.push(...parts); if (lines.length > max) lines = lines.slice(-max);
+				draw();
+			},
+			end(code) {
+				if (partial) lines.push(partial);
+				lines.push('— stopped' + (code ? ' (exit ' + code + ')' : '') + ' —');
+				if (code === 77) lines.push('This needs root: install the read-only sudo rule with install.sh.');
+				draw(); startBtn.disabled = false; stopBtn.disabled = true;
+			},
+		};
+		stopBtn.onclick = () => FC.call('streamStop', { sid: id });
+		return id;
+	});
+}
+$('pflogStart').onclick = () => stream(['ro', 'follow', 'pflog'], $('pflogOut'), $('pflogFilter'), $('pflogStart'), $('pflogStop'));
+
+// ---- logs tab
+let logLines = [];
+function drawLog() {
+	const f = $('logFilter').value.toLowerCase(), quiet = $('logNoise').checked;
+	$('logOut').textContent = logLines.filter(l => !(quiet && isNoise(l)) && (!f || l.toLowerCase().includes(f))).join('\n');
+}
+$('logFilter').oninput = drawLog;
+$('logNoise').onchange = drawLog;
+$('logSel').onchange = () => {
+	const m = META.logs.find(l => l.name === $('logSel').value);
+	$('logDesc').textContent = m ? m.desc + ' — ' + m.path : '';
+	$('logLines').disabled = m && m.name === 'pflog';
+	$('logLoad').disabled = m && m.name === 'pflog';
+};
+$('logLoad').onclick = async () => {
+	const name = $('logSel').value;
+	$('logOut').textContent = 'Loading…';
+	const r = await ctl(['ro', 'log', name, String($('logLines').value || 500)]);
+	logLines = ((r.out || '') + (r.code ? '\n' + (r.err || '') : '')).split('\n');
+	drawLog();
+	const o = $('logOut'); o.scrollTop = o.scrollHeight;
+};
+$('logFollow').onclick = () => stream(['ro', 'follow', $('logSel').value], $('logOut'), $('logFilter'), $('logFollow'), $('logStop'));
+$('logConsole').onclick = () => {
+	const m = META.logs.find(l => l.name === $('logSel').value);
+	if (m && m.path.startsWith('/')) FC.call('openConsole', { path: m.path });
+	else toast('This log has no file to open', true);
+};
+
+// ---- config tab
+$('cfgSel').onchange = () => {
+	const m = META.configs.find(c => c.name === $('cfgSel').value);
+	$('cfgDesc').textContent = m ? m.desc + ' — ' + m.path : '';
+	$('cfgSave').disabled = true; $('cfgText').value = ''; $('cfgOut').classList.add('hidden');
+};
+$('cfgLoad').onclick = async () => {
+	const r = await ctl(['ro', 'config-read', $('cfgSel').value]);
+	if (r.code !== 0) { toast('Could not read: ' + (r.err || r.out), true); return; }
+	$('cfgText').value = r.out; $('cfgSave').disabled = false;
+};
+$('cfgSave').onclick = async () => {
+	if (!confirm('Validate and save ' + $('cfgSel').value + '?')) return;
+	const r = await FC.call('saveConfig', { name: $('cfgSel').value, content: $('cfgText').value });
+	const o = $('cfgOut'); o.classList.remove('hidden');
+	o.textContent = ((r.out || '') + (r.err || '')).trim();
+	o.className = r.code === 0 ? '' : 'error';
+	toast(r.code === 0 ? 'Saved ' + $('cfgSel').value : 'Not saved: see output', r.code !== 0);
+};
+
+// ---- health tab
+async function runText(args, target) {
+	$(target).textContent = 'Running…';
+	const r = await ctl(args);
+	$(target).textContent = ((r.out || '') + (r.err || '')).trim();
+}
+$('hcRun').onclick = () => runText(['ro', 'setup-check'], 'hcOut');
+$('atkRun').onclick = () => runText(['ro', 'attacks'], 'hcOut');
+
+// ---- privoxy debug levels
+const DEBUG = [[1, 'every request'], [1024, 'blocked requests + reason'], [4096, 'startup & warnings'], [8192, 'non-fatal errors (TLS failures)'], [65536, 'actions applied (very verbose)'], [512, 'common log format']];
+$('debugBoxes').append(...DEBUG.map(([v, label]) => el('label', {}, el('input', { type: 'checkbox', value: v, onchange: e => e.target.dataset.touched = 1 }), ' ' + v + ' ' + label + ' ')));
+$('debugApply').onclick = e => {
+	const levels = [...document.querySelectorAll('#debugBoxes input')].filter(i => i.checked).map(i => i.value);
+	document.querySelectorAll('#debugBoxes input').forEach(i => delete i.dataset.touched);
+	act(['privoxy', 'debug', ...levels], null, e.target);
+};
+
+// ---- settings
+async function loadSettings() {
+	const s = await FC.call('settingsGet');
+	$('setPoll').value = s.poll; $('setNotify').checked = s.notify; $('setLogin').checked = s.login;
+}
+$('setSave').onclick = async () => {
+	await FC.call('settingsSet', { poll: Number($('setPoll').value), notify: $('setNotify').checked, login: $('setLogin').checked });
+	toast('Settings saved');
+};
+$('setTestNotify').onclick = () => FC.call('testNotify');
+
+// ---- startup
+(async () => {
+	const r = await ctl(['ro', 'meta'], false);
+	try { META = JSON.parse(r.out); } catch (e) { toast('Could not load metadata: ' + (r.err || r.out), true); return; }
+	$('logSel').replaceChildren(...META.logs.map(l => el('option', { value: l.name }, l.name)));
+	$('cfgSel').replaceChildren(...META.configs.map(c => el('option', { value: c.name }, c.name)));
+	$('ipTable').replaceChildren(...META.pf_tables.map(t => el('option', { value: t }, t)));
+	$('logSel').onchange(); $('cfgSel').onchange();
+	loadSettings();
+	const st = await FC.call('status');
+	if (st) renderStatus(st);
+	FC.call('refresh');
+})();
+</script>
+</body>
+</html>

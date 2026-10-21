@@ -1,0 +1,674 @@
+#!/bin/bash
+
+# fortressctl: privileged backend for Fortress Controller (macOS-Fortress).
+#
+# Installed root-owned at /usr/local/libexec/fortress-controller/fortressctl.
+# Every command is from a fixed list and every argument is validated, so a
+# sudoers rule can safely point at this file.
+#
+#   fortressctl ro <command> ...   read-only: status, logs, PF tables, configs
+#   fortressctl <command> ...      changes things: services, PF, feeds, proxy
+#
+# Commands that need root exit 77 when run without it.
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export LC_ALL=C
+umask 022
+
+P=/opt/local
+FE=$P/etc/macos-fortress
+PRIVOXY_CONF=$P/etc/privoxy/config
+PRIVOXY_CA=$P/etc/privoxy/CA
+PRIVOXY_CERTS=$P/var/privoxy/certs
+PAC_FILE=/Library/WebServer/Documents/proxy.pac
+PAC_URL=http://localhost/proxy.pac
+BACKUP_DIR=$P/var/fortress-controller/backups
+
+LABELS="org.macports.macos-fortress
+org.macports.macos-fortress-pf
+org.macports.macos-fortress-pf.subports
+org.macports.macos-fortress-pf.brutexpire
+org.macports.macos-fortress-dshield
+org.macports.macos-fortress-emergingthreats
+org.macports.macos-fortress-hosts
+org.macports.macos-fortress-proxy
+org.macports.Privoxy
+org.macports.Privoxy.delete-expired-certs
+org.macports.adblock2privoxy
+org.macports.adblock2privoxy-nginx"
+
+# Daemons that should always be running (the rest run on a schedule).
+ALWAYS_ON="org.macports.macos-fortress
+org.macports.macos-fortress-pf
+org.macports.macos-fortress-pf.subports
+org.macports.macos-fortress-proxy
+org.macports.Privoxy
+org.macports.adblock2privoxy
+org.macports.adblock2privoxy-nginx"
+
+die() { printf 'fortressctl: %s\n' "$*" >&2; exit 2; }
+need_root() { [ "$(id -u)" = 0 ] || { echo "fortressctl: this needs root" >&2; exit 77; }; }
+in_list() { printf '%s\n' "$2" | grep -qxF -- "$1"; }
+
+# --- JSON helpers (bash 3.2 compatible) -------------------------------------
+
+jstr() {
+	local s=$1
+	s=${s//\\/\\\\}; s=${s//\"/\\\"}
+	s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+	s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')
+	printf '"%s"' "$s"
+}
+jbool() { if [ "$1" = 1 ]; then printf true; else printf false; fi; }
+jnum() { case $1 in ''|*[!0-9-]*) printf null;; *) printf '%s' "$1";; esac; }
+
+# --- name -> path tables ----------------------------------------------------
+
+LOGS="fortress|$P/var/log/macos-fortress.log|Feed updates, PF loads, hosts list builds (all macos-fortress daemons)
+adblock2privoxy|$P/var/log/adblock2privoxy.log|Adblock filter list downloads and conversion
+privoxy|$P/var/log/privoxy/logfile|Privoxy proxy (what gets logged depends on the debug level)
+nginx-error|$P/var/log/nginx/error.log|nginx errors (blackhole server)
+nginx-access|$P/var/log/nginx/access.log|nginx requests (blackhole server)
+apache-error|/var/log/apache2/error_log|Apache errors (serves proxy.pac)
+apache-access|/var/log/apache2/access_log|Apache requests (who fetched proxy.pac)
+pflog|pflog0|Live PF firewall blocks (packets hitting log rules)
+launchd|unified-log|macOS system log entries about the fortress daemons"
+
+CONFIGS="whitelist|$FE/whitelist.txt|Hosts allowlist: domains removed from the blocklist (apply with Update hosts)
+blacklist|$FE/blacklist.txt|Hosts blocklist additions in hosts format (apply with Update hosts)
+pf.conf|$FE/pf.conf|PF firewall rules (apply with Reload PF)
+blockips.conf|$FE/blockips.conf|PF blocklist tables anchor (apply with Reload PF)
+proxy.pac|$PAC_FILE|Proxy auto-config: which hosts bypass the proxy
+ab2p-blocklist|$P/etc/adblock2privoxy/adblock2privoxy_blocklist.txt|Adblock filter list URLs (apply with Re-initialize adblock2privoxy)
+privoxy-config|$PRIVOXY_CONF|Privoxy main config (ca-password is hidden)
+match-all.action|$P/etc/privoxy/match-all.action|Privoxy actions for all sites, incl. which sites skip HTTPS inspection
+user.action|$P/etc/privoxy/user.action|Privoxy user actions
+user.filter|$P/etc/privoxy/user.filter|Privoxy user filters
+ab2p-nginx.conf|$P/etc/adblock2privoxy/nginx.conf|nginx config for the blackhole server on 127.0.0.1:8119"
+
+field() { printf '%s\n' "$1" | awk -F'|' -v k="$2" -v f="$3" '$1==k{print $f; exit}'; }
+log_path() { field "$LOGS" "$1" 2; }
+config_path() { field "$CONFIGS" "$1" 2; }
+
+valid_ip() { printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9A-Fa-f:]+(/[0-9]{1,3})?$'; }
+
+PF_TABLES="bruteforce|
+emerging_threats|blockips
+compromised_ips|blockips
+dshield_block_ip|blockips"
+
+pf_table_cmd() { # <table> -> pfctl args prefix
+	local anchor
+	anchor=$(field "$PF_TABLES" "$1" 2)
+	in_list "$1" "$(printf '%s\n' "$PF_TABLES" | cut -d'|' -f1)" || die "unknown PF table: $1"
+	if [ -n "$anchor" ]; then echo "-a $anchor -t $1"; else echo "-t $1"; fi
+}
+
+# --- status -----------------------------------------------------------------
+
+svc_json() {
+	local label=$1 disabled=$2 out state pid lastexit runs plist interval cal installed always=0
+	plist=/Library/LaunchDaemons/$label.plist
+	installed=0; [ -f "$plist" ] && installed=1
+	in_list "$label" "$ALWAYS_ON" && always=1
+	out=$(launchctl print "system/$label" 2>/dev/null)
+	if [ -n "$out" ]; then
+		state=$(printf '%s\n' "$out" | awk -F' = ' '/^\tstate = /{print $2; exit}')
+		pid=$(printf '%s\n' "$out" | awk -F' = ' '/^\tpid = /{print $2; exit}')
+		lastexit=$(printf '%s\n' "$out" | awk -F' = ' '/^\tlast exit code = /{print $2; exit}')
+		runs=$(printf '%s\n' "$out" | awk -F' = ' '/^\truns = /{print $2; exit}')
+	else
+		state=unloaded
+	fi
+	interval=""; cal=""
+	if [ $installed = 1 ]; then
+		interval=$(plutil -extract StartInterval raw "$plist" 2>/dev/null)
+		cal=$(plutil -extract StartCalendarInterval json -o - "$plist" 2>/dev/null)
+	fi
+	printf '{"label":%s,"installed":%s,"always_on":%s,"state":%s,"pid":%s,"last_exit":%s,"runs":%s,"interval":%s,"calendar":%s,"disabled":%s}' \
+		"$(jstr "$label")" "$(jbool $installed)" "$(jbool $always)" "$(jstr "$state")" \
+		"$(jnum "$pid")" "$(jstr "$lastexit")" "$(jnum "$runs")" "$(jnum "$interval")" \
+		"$(jstr "$cal")" "$(jbool "$(printf '%s\n' "$disabled" | grep -qF "\"$label\" => disabled" && echo 1)")"
+}
+
+file_json() { # name path
+	local m s l=null
+	if [ -e "$2" ]; then
+		m=$(stat -f %m "$2"); s=$(stat -f %z "$2")
+		[ -r "$2" ] && l=$(wc -l < "$2" | tr -d ' ')
+	fi
+	printf '{"name":%s,"path":%s,"mtime":%s,"size":%s,"lines":%s}' \
+		"$(jstr "$1")" "$(jstr "$2")" "$(jnum "$m")" "$(jnum "$s")" "$(jnum "$l")"
+}
+
+cmd_status() {
+	local t now root=0 issues="" tmp listen disabled
+	now=$(date +%s)
+	[ "$(id -u)" = 0 ] && root=1
+	tmp=$(mktemp -d /tmp/fortressctl.XXXXXX) || die "mktemp failed"
+	trap 'rm -rf "$tmp"' EXIT
+
+	# End-to-end checks through the proxy, run in parallel.
+	# example.com is HTTPS-inspected (not excluded in match-all.action), so it
+	# only succeeds when Privoxy can mint certificates signed by its CA.
+	C="curl -s -m 6 -o /dev/null"
+	X="-x http://127.0.0.1:8118"
+	$C $X -w '%{http_code}' http://p.p/ > "$tmp/pp" 2>/dev/null &
+	$C -w '%{http_code}' "$PAC_URL" > "$tmp/pac" 2>/dev/null &
+	$C -k -w '%{http_code}' https://127.0.0.1:8119/ > "$tmp/blackhole" 2>/dev/null &
+	$C $X --cacert "$PRIVOXY_CA/ca.cert.pem" -w '%{http_code}' https://example.com/ > "$tmp/inspect" 2>/dev/null &
+	$C $X -w '%{http_code}' http://doubleclick.net/ > "$tmp/block_http" 2>/dev/null &
+	$C $X --cacert "$PRIVOXY_CA/ca.cert.pem" -w '%{http_code}' https://ad.doubleclick.net/ > "$tmp/block_https" 2>/dev/null &
+	$C $X -w '%{http_code}' https://github.com/ > "$tmp/passthrough" 2>/dev/null &
+
+	listen=$(netstat -an -p tcp 2>/dev/null | awk '$6=="LISTEN"{print $4}')
+	has_listen() { printf '%s\n' "$listen" | grep -qE "[.:]$1\$"; }
+	disabled=$(launchctl print-disabled system 2>/dev/null)
+
+	printf '{"time":%s,"root":%s,"services":[' "$now" "$(jbool $root)"
+	local first=1
+	for t in $LABELS; do
+		[ $first = 1 ] || printf ','; first=0
+		svc_json "$t" "$disabled"
+	done
+	printf ']'
+
+	# Health issues for always-on daemons and scheduled jobs.
+	for t in $LABELS; do
+		local o st le
+		o=$(launchctl print "system/$t" 2>/dev/null)
+		st=$(printf '%s\n' "$o" | awk -F' = ' '/^\tstate = /{print $2; exit}')
+		le=$(printf '%s\n' "$o" | awk -F' = ' '/^\tlast exit code = /{print $2; exit}')
+		if [ -z "$o" ]; then
+			issues="$issues
+error|svc:$t|$t is not loaded"
+		elif in_list "$t" "$ALWAYS_ON" && [ "$st" != running ]; then
+			issues="$issues
+error|svc:$t|$t is not running (state: $st)"
+		elif ! in_list "$t" "$ALWAYS_ON"; then
+			case $le in 0|'(never exited)'|'') ;; *) issues="$issues
+warn|exit:$t|$t last run failed (exit $le)";; esac
+		fi
+	done
+
+	local l_privoxy=0 l_blackhole=0 l_pac=0
+	has_listen 8118 && l_privoxy=1
+	has_listen 8119 && l_blackhole=1
+	has_listen 80 && l_pac=1
+	printf ',"listeners":{"privoxy":%s,"blackhole":%s,"pac":%s}' \
+		"$(jbool $l_privoxy)" "$(jbool $l_blackhole)" "$(jbool $l_pac)"
+
+	wait
+	local pp pac bh insp bhttp bhttps pass
+	pp=$(cat "$tmp/pp"); pac=$(cat "$tmp/pac"); bh=$(cat "$tmp/blackhole")
+	insp=$(cat "$tmp/inspect"); bhttp=$(cat "$tmp/block_http")
+	bhttps=$(cat "$tmp/block_https"); pass=$(cat "$tmp/passthrough")
+	printf ',"checks":{"privoxy_http":%s,"pac_http":%s,"blackhole_http":%s,"https_inspection":%s,"block_http":%s,"block_https":%s,"passthrough_https":%s}' \
+		"$(jstr "$pp")" "$(jstr "$pac")" "$(jstr "$bh")" "$(jstr "$insp")" \
+		"$(jstr "$bhttp")" "$(jstr "$bhttps")" "$(jstr "$pass")"
+
+	ok_code() { case $1 in 2??|3??) return 0;; *) return 1;; esac; }
+	ok_code "$pp" || issues="$issues
+error|privoxy|Privoxy is not answering on 127.0.0.1:8118"
+	ok_code "$pac" || issues="$issues
+error|pac|proxy.pac is not being served at $PAC_URL (Apache)"
+	ok_code "$bh" || issues="$issues
+warn|blackhole|Blackhole server is not answering on 127.0.0.1:8119"
+	[ "$bhttp" = 403 ] || issues="$issues
+error|block_http|Privoxy is not blocking a known ad host over HTTP"
+
+	# System proxy (what browsers actually use).
+	local pac_on pac_url svc svcs="" sfirst=1 svc_json_all=""
+	pac_on=$(scutil --proxy 2>/dev/null | awk '/ProxyAutoConfigEnable/{print $3}')
+	pac_url=$(scutil --proxy 2>/dev/null | awk '/ProxyAutoConfigURLString/{print $3}')
+	while IFS= read -r svc; do
+		[ -n "$svc" ] || continue
+		local name=${svc#\*} active=1 u e
+		[ "$name" != "$svc" ] && active=0
+		u=$(networksetup -getautoproxyurl "$name" 2>/dev/null | awk -F': ' '/^URL/{print $2}')
+		e=$(networksetup -getautoproxyurl "$name" 2>/dev/null | awk -F': ' '/^Enabled/{print $2}')
+		[ $sfirst = 1 ] || svc_json_all="$svc_json_all,"; sfirst=0
+		svc_json_all="$svc_json_all{\"name\":$(jstr "$name"),\"service_enabled\":$(jbool $active),\"pac_enabled\":$(jbool "$([ "$e" = Yes ] && echo 1)"),\"pac_url\":$(jstr "$u")}"
+	done <<EOF
+$(networksetup -listallnetworkservices 2>/dev/null | sed 1d)
+EOF
+	printf ',"system_proxy":{"pac_enabled":%s,"pac_url":%s,"services":[%s]}' \
+		"$(jbool "$([ "$pac_on" = 1 ] && echo 1)")" "$(jstr "$pac_url")" "$svc_json_all"
+
+	if [ "$pac_on" != 1 ]; then
+		issues="$issues
+warn|sysproxy|System proxy is off: browsers are not going through the fortress (no ad blocking)"
+	fi
+	if ! ok_code "$insp"; then
+		if [ "$pac_on" = 1 ]; then
+			issues="$issues
+error|https_inspection|HTTPS inspection is failing while the system proxy is on: most HTTPS sites will not load"
+		else
+			issues="$issues
+error|https_inspection|HTTPS inspection is failing (Privoxy cannot complete TLS for inspected sites)"
+		fi
+	elif [ "$bhttps" != 403 ]; then
+		issues="$issues
+warn|block_https|Privoxy is not blocking a known ad host over HTTPS"
+	fi
+
+	# Privoxy CA and trust bundle.
+	local ca_trusted=0 key_mode bundle_size
+	security verify-cert -c "$PRIVOXY_CA/ca.cert.pem" -L -l >/dev/null 2>&1 && ca_trusted=1
+	key_mode=$(stat -f %Lp "$PRIVOXY_CA/ca.key.pem" 2>/dev/null)
+	bundle_size=$(stat -f %z "$PRIVOXY_CA/trustedCAs.pem" 2>/dev/null)
+	printf ',"privoxy_ca":{"trusted":%s,"key_mode":%s,"trusted_cas_size":%s,"cert_cache":%s}' \
+		"$(jbool $ca_trusted)" "$(jstr "$key_mode")" "$(jnum "$bundle_size")" \
+		"$(jnum "$(ls "$PRIVOXY_CERTS" 2>/dev/null | grep -c '\.crt$')")"
+	[ $ca_trusted = 1 ] || issues="$issues
+warn|ca_trust|Privoxy CA is not trusted in the System keychain (browsers will reject inspected sites)"
+	case $key_mode in 600|400|'') ;; *) issues="$issues
+warn|ca_key_mode|Privoxy CA private key is readable by other users (mode $key_mode, should be 600)";; esac
+	[ "${bundle_size:-0}" -gt 0 ] || issues="$issues
+error|trusted_cas|trustedCAs.pem is empty: Privoxy cannot verify any HTTPS site"
+
+	# Interface PF rules are written for.
+	local pf_if def_if
+	pf_if=$(awk -F'"' '/^int_if[[:space:]]*=/{print $2; exit}' "$FE/pf.conf" 2>/dev/null)
+	def_if=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+	printf ',"interface":{"pf_int_if":%s,"default_if":%s}' "$(jstr "$pf_if")" "$(jstr "$def_if")"
+	if [ -n "$def_if" ] && [ -n "$pf_if" ] && [ "$pf_if" != "$def_if" ]; then
+		issues="$issues
+warn|int_if|pf.conf is written for $pf_if but traffic currently goes out $def_if"
+	fi
+
+	# Feed and list files (age, size, entries).
+	printf ',"files":['
+	printf '%s,' "$(file_json 'DShield blocklist' "$FE/dshield_block_ip.txt")"
+	printf '%s,' "$(file_json 'Emerging Threats IPs' "$FE/emerging-Block-IPs.txt")"
+	printf '%s,' "$(file_json 'Compromised IPs' "$FE/compromised-ips.txt")"
+	printf '%s,' "$(file_json 'Hosts blocklist' "$FE/macos-fortress-hosts")"
+	printf '%s,' "$(file_json 'Privoxy hosts action' "$FE/macos-fortress-hosts.action")"
+	printf '%s,' "$(file_json 'Adblock actions (ab2p)' "$P/etc/adblock2privoxy/privoxy/ab2p.action")"
+	printf '%s,' "$(file_json 'Adblock filters (ab2p)' "$P/etc/adblock2privoxy/privoxy/ab2p.filter")"
+	printf '%s,' "$(file_json 'Hosts allowlist' "$FE/whitelist.txt")"
+	printf '%s' "$(file_json 'Hosts blocklist additions' "$FE/blacklist.txt")"
+	printf ']'
+
+	stale() { # path max_age_seconds label
+		local m
+		m=$(stat -f %m "$1" 2>/dev/null) || { issues="$issues
+warn|stale:$3|$3 is missing"; return; }
+		[ $((now - m)) -le "$2" ] || issues="$issues
+warn|stale:$3|$3 has not been updated in $(((now - m) / 3600)) hours"
+	}
+	stale "$FE/dshield_block_ip.txt" $((11250 * 4)) "DShield blocklist"
+	stale "$FE/emerging-Block-IPs.txt" $((47250 * 3)) "Emerging Threats blocklist"
+	stale "$FE/macos-fortress-hosts" $((86850 * 3)) "Hosts blocklist"
+	stale "$P/etc/adblock2privoxy/privoxy/ab2p.action" $((86400 * 15)) "Adblock filter lists"
+
+	# Recent errors in the fortress log (download failures etc.).
+	local errs last_err
+	errs=$(grep -cE 'ERROR [0-9]+|failed:|No such file|cannot|syntax error' "$P/var/log/macos-fortress.log" 2>/dev/null)
+	last_err=$(grep -E 'ERROR [0-9]+|failed:|No such file|cannot|syntax error' "$P/var/log/macos-fortress.log" 2>/dev/null | tail -1)
+	printf ',"fortress_log":{"error_count":%s,"last_error":%s,"size":%s}' \
+		"$(jnum "$errs")" "$(jstr "$last_err")" \
+		"$(jnum "$(stat -f %z "$P/var/log/macos-fortress.log" 2>/dev/null)")"
+
+	# Root-only: PF and Privoxy config state.
+	if [ $root = 1 ]; then
+		local si enabled=0 states tf=1 tname tcmd count hits attacks=0 rules arules
+		si=$(pfctl -si 2>/dev/null)
+		printf '%s\n' "$si" | grep -q '^Status: Enabled' && enabled=1
+		states=$(printf '%s\n' "$si" | awk '/current entries/{print $3}')
+		rules=$(pfctl -sr 2>/dev/null | grep -c .)
+		arules=$(pfctl -a blockips -sr 2>/dev/null | grep -c .)
+		printf ',"pf":{"enabled":%s,"states":%s,"rules":%s,"anchor_rules":%s,"tables":[' \
+			"$(jbool $enabled)" "$(jnum "$states")" "$(jnum "$rules")" "$(jnum "$arules")"
+		for tname in $(printf '%s\n' "$PF_TABLES" | cut -d'|' -f1); do
+			tcmd=$(pf_table_cmd "$tname")
+			count=$(pfctl $tcmd -T show 2>/dev/null | grep -c .)
+			if [ "$tname" = bruteforce ]; then
+				hits=$count
+			else
+				hits=$(pfctl $tcmd -T show -v 2>/dev/null | grep -cE 'Packets: [1-9]')
+			fi
+			attacks=$((attacks + hits))
+			[ $tf = 1 ] || printf ','; tf=0
+			printf '{"name":%s,"entries":%s,"hits":%s}' "$(jstr "$tname")" "$(jnum "$count")" "$(jnum "$hits")"
+		done
+		printf '],"attacks":%s}' "$attacks"
+		if [ $enabled = 0 ]; then
+			issues="$issues
+error|pf|PF firewall is disabled"
+		elif [ "${rules:-0}" = 0 ]; then
+			issues="$issues
+error|pf_rules|PF is enabled but no rules are loaded, so nothing is filtered (use Reload PF)"
+		fi
+
+		local toggle debug
+		toggle=$(awk '/^[[:space:]]*toggle[[:space:]]/{print $2; exit}' "$PRIVOXY_CONF" 2>/dev/null)
+		debug=$(awk '/^[[:space:]]*debug[[:space:]]/{printf "%s%s", s, $2; s=","}' "$PRIVOXY_CONF" 2>/dev/null)
+		printf ',"privoxy":{"toggle":%s,"debug":[%s],"ca_password_set":%s}' \
+			"$(jstr "$toggle")" "$debug" \
+			"$(jbool "$(grep -qE '^[[:space:]]*ca-password[[:space:]]+[^[:space:]]' "$PRIVOXY_CONF" && echo 1)")"
+		[ "$toggle" = 0 ] && issues="$issues
+warn|privoxy_toggle|Privoxy filtering is toggled off"
+
+		# Privoxy defaults to cacert.crt / cakey.pem, but the port installs
+		# ca.cert.pem / ca.key.pem without pointing the config at them.
+		local cadir cafile cakey
+		cadir=$(awk '/^[[:space:]]*ca-directory[[:space:]]/{print $2; exit}' "$PRIVOXY_CONF")
+		cafile=$(awk '/^[[:space:]]*ca-cert-file[[:space:]]/{print $2; exit}' "$PRIVOXY_CONF")
+		cakey=$(awk '/^[[:space:]]*ca-key-file[[:space:]]/{print $2; exit}' "$PRIVOXY_CONF")
+		if [ -n "$cadir" ]; then
+			[ -f "$cadir/${cafile:-cacert.crt}" ] || issues="$issues
+error|ca_cert_file|Privoxy's CA certificate $cadir/${cafile:-cacert.crt} does not exist (set ca-cert-file in the Privoxy config)"
+			[ -f "$cadir/${cakey:-cakey.pem}" ] || issues="$issues
+error|ca_key_file|Privoxy's CA key $cadir/${cakey:-cakey.pem} does not exist (set ca-key-file in the Privoxy config)"
+		fi
+	fi
+
+	printf ',"issues":['
+	local ifirst=1 lvl key msg
+	while IFS='|' read -r lvl key msg; do
+		[ -n "$lvl" ] || continue
+		[ $ifirst = 1 ] || printf ','; ifirst=0
+		printf '{"level":%s,"key":%s,"message":%s}' "$(jstr "$lvl")" "$(jstr "$key")" "$(jstr "$msg")"
+	done <<EOF
+$issues
+EOF
+	printf ']}\n'
+}
+
+# --- read-only commands -----------------------------------------------------
+
+cmd_meta() {
+	local first=1 n p d
+	printf '{"logs":['
+	while IFS='|' read -r n p d; do
+		[ $first = 1 ] || printf ','; first=0
+		printf '{"name":%s,"path":%s,"desc":%s}' "$(jstr "$n")" "$(jstr "$p")" "$(jstr "$d")"
+	done <<EOF
+$LOGS
+EOF
+	first=1
+	printf '],"configs":['
+	while IFS='|' read -r n p d; do
+		[ $first = 1 ] || printf ','; first=0
+		printf '{"name":%s,"path":%s,"desc":%s}' "$(jstr "$n")" "$(jstr "$p")" "$(jstr "$d")"
+	done <<EOF
+$CONFIGS
+EOF
+	printf '],"pf_tables":['
+	first=1
+	for n in $(printf '%s\n' "$PF_TABLES" | cut -d'|' -f1); do
+		[ $first = 1 ] || printf ','; first=0
+		jstr "$n"
+	done
+	printf '],"pac_url":%s}\n' "$(jstr "$PAC_URL")"
+}
+
+cmd_log() { # name [lines]
+	local n=${2:-500} path
+	case $n in ''|*[!0-9]*) die "bad line count";; esac
+	[ "$n" -le 20000 ] || n=20000
+	case $1 in
+	launchd)
+		log show --last "$((n > 1440 ? 1440 : n))m" --style compact \
+			--predicate 'eventMessage CONTAINS "org.macports" OR process == "daemondo" OR process == "privoxy" OR process == "nginx" OR process == "pfctl"' 2>&1 | tail -n 5000
+		return ;;
+	pflog) die "pflog is live only: use 'ro follow pflog'" ;;
+	esac
+	path=$(log_path "$1"); [ -n "$path" ] || die "unknown log: $1"
+	[ -e "$path" ] || die "$path does not exist"
+	[ -r "$path" ] || { echo "fortressctl: $path is only readable by root" >&2; exit 77; }
+	tail -n "$n" "$path"
+}
+
+cmd_follow() {
+	local path
+	case $1 in
+	pflog)
+		need_root
+		ifconfig pflog0 >/dev/null 2>&1 || ifconfig pflog0 create
+		exec tcpdump -n -e -ttt -l -i pflog0 2>&1 ;;
+	launchd)
+		exec log stream --style compact \
+			--predicate 'eventMessage CONTAINS "org.macports" OR process == "daemondo" OR process == "privoxy" OR process == "nginx" OR process == "pfctl"' 2>&1 ;;
+	esac
+	path=$(log_path "$1"); [ -n "$path" ] || die "unknown log: $1"
+	[ -r "$path" ] || { echo "fortressctl: $path is only readable by root" >&2; exit 77; }
+	exec tail -n 200 -F "$path"
+}
+
+cmd_config_read() {
+	local path
+	path=$(config_path "$1"); [ -n "$path" ] || die "unknown config: $1"
+	[ -r "$path" ] || { echo "fortressctl: $path is only readable by root" >&2; exit 77; }
+	if [ "$1" = privoxy-config ]; then
+		sed -E 's/^([[:space:]]*ca-password[[:space:]]+).*/\1********/' "$path"
+	else
+		cat "$path"
+	fi
+}
+
+cmd_pf_table() {
+	need_root
+	pfctl $(pf_table_cmd "$1") -T show 2>/dev/null
+}
+
+cmd_pf_test() {
+	need_root
+	valid_ip "$1" || die "not an IP address: $1"
+	local t
+	for t in $(printf '%s\n' "$PF_TABLES" | cut -d'|' -f1); do
+		if pfctl $(pf_table_cmd "$t") -T test "$1" >/dev/null 2>&1; then
+			echo "$t: MATCH"
+		else
+			echo "$t: no match"
+		fi
+	done
+}
+
+cmd_ro() {
+	local c=$1; shift
+	case $c in
+	status) cmd_status ;;
+	meta) cmd_meta ;;
+	log) cmd_log "$@" ;;
+	follow) cmd_follow "$@" ;;
+	config-read) cmd_config_read "$@" ;;
+	pf-table) cmd_pf_table "$@" ;;
+	pf-test) cmd_pf_test "$@" ;;
+	setup-check) need_root; exec $P/bin/macosfortress_setup_check.sh 2>&1 ;;
+	attacks) need_root; exec $P/bin/pf_attacks.sh 2>&1 ;;
+	*) die "unknown read-only command: $c" ;;
+	esac
+}
+
+# --- commands that change things --------------------------------------------
+
+cmd_service() { # start|stop|restart|run <label>
+	need_root
+	in_list "$2" "$LABELS" || die "unknown service: $2"
+	case $1 in
+	start) launchctl enable "system/$2"; launchctl bootstrap system "/Library/LaunchDaemons/$2.plist" ;;
+	stop) launchctl bootout "system/$2"; launchctl disable "system/$2" ;;
+	restart) launchctl kickstart -k "system/$2" ;;
+	run) launchctl kickstart "system/$2" ;;
+	*) die "unknown service action: $1" ;;
+	esac
+}
+
+cmd_pf() {
+	need_root
+	case $1 in
+	enable|reload) pfctl -Fall 2>&1 && pfctl -ef "$FE/pf.conf" 2>&1 ;;
+	disable) pfctl -d 2>&1 ;;
+	reload-blockips) pfctl -a blockips -T load -f "$FE/blockips.conf" 2>&1 ;;
+	flush-bruteforce) pfctl -t bruteforce -T flush 2>&1 ;;
+	expire-bruteforce) pfctl -t bruteforce -T expire 604800 2>&1 ;;
+	block) valid_ip "$2" || die "not an IP address: $2"; pfctl -t bruteforce -T add "$2" 2>&1 ;;
+	unblock)
+		valid_ip "$2" || die "not an IP address: $2"
+		[ -n "$3" ] || set -- "$1" "$2" bruteforce
+		pfctl $(pf_table_cmd "$3") -T delete "$2" 2>&1 ;;
+	*) die "unknown pf action: $1" ;;
+	esac
+}
+
+cmd_update() {
+	need_root
+	local f
+	case $1 in
+	all) set -- dshield emergingthreats hosts adblock2privoxy ;;
+	esac
+	for f in "$@"; do
+		case $f in
+		dshield|emergingthreats|hosts) launchctl kickstart "system/org.macports.macos-fortress-$f" && echo "started $f update" ;;
+		adblock2privoxy) launchctl kickstart -k system/org.macports.adblock2privoxy && echo "started adblock2privoxy update (takes a few minutes)" ;;
+		*) die "unknown feed: $f" ;;
+		esac
+	done
+}
+
+set_privoxy_conf() { # sed expression, applied atomically keeping owner/mode
+	local tmp
+	tmp=$(mktemp "$PRIVOXY_CONF.XXXXXX") || die "mktemp failed"
+	sed -E "$1" "$PRIVOXY_CONF" > "$tmp" && cat "$tmp" > "$PRIVOXY_CONF"
+	rm -f "$tmp"
+}
+
+cmd_privoxy() {
+	need_root
+	case $1 in
+	filtering-on|filtering-off)
+		local v=1; [ "$1" = filtering-off ] && v=0
+		if grep -qE '^[[:space:]]*toggle[[:space:]]' "$PRIVOXY_CONF"; then
+			set_privoxy_conf "s/^([[:space:]]*toggle[[:space:]]+)[01]/\\1$v/"
+		else
+			echo "toggle $v" >> "$PRIVOXY_CONF"
+		fi
+		echo "Privoxy filtering set to $v (Privoxy re-reads its config automatically)" ;;
+	debug)
+		# privoxy debug flags: 1 requests, 1024 blocked, 4096 startup/warnings,
+		# 8192 non-fatal errors (TLS failures), 65536 actions applied
+		shift
+		local d
+		for d in "$@"; do in_list "$d" "1
+2
+512
+1024
+4096
+8192
+65536" || die "unsupported debug level: $d"; done
+		set_privoxy_conf '/^[[:space:]]*debug[[:space:]]/d'
+		for d in "$@"; do echo "debug $d" >> "$PRIVOXY_CONF"; done
+		echo "Privoxy debug levels: ${*:-none}" ;;
+	restart) launchctl kickstart -k system/org.macports.Privoxy ;;
+	clear-certs)
+		find "$PRIVOXY_CERTS" -maxdepth 1 -type f \( -name '*.crt' -o -name '*.pem' \) -delete
+		launchctl kickstart -k system/org.macports.Privoxy
+		echo "Cleared Privoxy's generated site certificates and restarted it" ;;
+	expire-certs) launchctl kickstart system/org.macports.Privoxy.delete-expired-certs ;;
+	config-test) $P/sbin/privoxy --config-test "$PRIVOXY_CONF" 2>&1 && echo "config OK" ;;
+	*) die "unknown privoxy action: $1" ;;
+	esac
+}
+
+cmd_sysproxy() { # on|off <network service>
+	need_root
+	networksetup -listallnetworkservices | sed 1d | sed 's/^\*//' | grep -qxF -- "$2" \
+		|| die "unknown network service: $2"
+	case $1 in
+	on) networksetup -setautoproxyurl "$2" "$PAC_URL" ;;
+	off) networksetup -setautoproxystate "$2" off ;;
+	*) die "unknown sysproxy action: $1" ;;
+	esac
+	networksetup -getautoproxyurl "$2"
+}
+
+cmd_config_install() { # name srcfile
+	need_root
+	local name=$1 src=$2 dest owner backup tmp existing
+	dest=$(config_path "$name"); [ -n "$dest" ] || die "unknown config: $name"
+	[ -f "$src" ] && [ ! -L "$src" ] || die "source must be a regular file"
+	[ "$(stat -f %z "$src")" -le 52428800 ] || die "source is too large"
+	# Under sudo, only accept files owned by the calling user, so this
+	# can't be used to copy other root-only files somewhere readable.
+	if [ -n "$SUDO_UID" ]; then
+		owner=$(stat -f %u "$src")
+		[ "$owner" = "$SUDO_UID" ] || die "source must be owned by you"
+	fi
+
+	tmp=$(mktemp /tmp/fortressctl-config.XXXXXX) || die "mktemp failed"
+	trap 'rm -f "$tmp"' EXIT
+	if [ "$name" = privoxy-config ]; then
+		existing=$(grep -m1 -E '^[[:space:]]*ca-password[[:space:]]' "$dest")
+		EXISTING=$existing awk '/^[[:space:]]*ca-password[[:space:]]+\*+[[:space:]]*$/ { if (ENVIRON["EXISTING"] != "") print ENVIRON["EXISTING"]; next } { print }' "$src" > "$tmp"
+	else
+		cat "$src" > "$tmp"
+	fi
+
+	case $name in
+	pf.conf) pfctl -n -f "$tmp" 2>&1 | grep -v ALTQ ; [ "${PIPESTATUS[0]}" = 0 ] || die "pf.conf has errors, not saved" ;;
+	blockips.conf) pfctl -n -a blockips -f "$tmp" 2>&1 | grep -v ALTQ ; [ "${PIPESTATUS[0]}" = 0 ] || die "blockips.conf has errors, not saved" ;;
+	proxy.pac) /System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc "$tmp" 2>&1 || die "proxy.pac is not valid JavaScript, not saved" ;;
+	privoxy-config) chmod 644 "$tmp"; $P/sbin/privoxy --config-test "$tmp" 2>&1 || die "Privoxy rejected the config, not saved" ;;
+	ab2p-nginx.conf) $P/sbin/nginx -t -c "$tmp" 2>&1 || die "nginx rejected the config, not saved" ;;
+	esac
+
+	mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+	backup="$BACKUP_DIR/$name.$(date +%Y%m%d-%H%M%S)"
+	cp -p "$dest" "$backup" || die "backup failed, not saved"
+	cat "$tmp" > "$dest" || die "write failed (backup at $backup)"
+	echo "Saved $dest (previous version: $backup)"
+
+	case $name in
+	ab2p-nginx.conf) launchctl kickstart -k system/org.macports.adblock2privoxy-nginx && echo "Restarted blackhole nginx" ;;
+	whitelist|blacklist) echo "Run 'Update hosts list' to apply" ;;
+	pf.conf|blockips.conf) echo "Run 'Reload PF' to apply" ;;
+	ab2p-blocklist) echo "Run 'Re-initialize adblock2privoxy' to apply" ;;
+	*) echo "Privoxy picks up the change on its next request" ;;
+	esac
+}
+
+case $1 in
+ro) shift; cmd_ro "$@" ;;
+service) shift; cmd_service "$@" ;;
+fortress)
+	need_root
+	case $2 in load|unload|reload) exec $P/bin/port "$2" macos-fortress ;; *) die "usage: fortress load|unload|reload" ;; esac ;;
+pf) shift; cmd_pf "$@" ;;
+update) shift; cmd_update "$@" ;;
+ab2p-reinit) need_root; exec $P/etc/adblock2privoxy/bin/adblock2privoxy_initialize.sh ;;
+privoxy) shift; cmd_privoxy "$@" ;;
+apache)
+	need_root
+	[ "$2" = restart ] || die "usage: apache restart"
+	launchctl kickstart -k system/org.apache.httpd ;;
+sysproxy) shift; cmd_sysproxy "$@" ;;
+ca)
+	need_root
+	case $2 in
+	trust) security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$PRIVOXY_CA/ca.cert.pem" ;;
+	untrust) security remove-trusted-cert -d "$PRIVOXY_CA/ca.cert.pem" ;;
+	*) die "usage: ca trust|untrust" ;;
+	esac ;;
+config-install) shift; cmd_config_install "$@" ;;
+*)
+	cat >&2 <<'USAGE'
+usage: fortressctl ro status|meta|setup-check|attacks
+       fortressctl ro log <name> [lines] | follow <name> | config-read <name>
+       fortressctl ro pf-table <table> | pf-test <ip>
+       fortressctl service start|stop|restart|run <label>
+       fortressctl fortress load|unload|reload
+       fortressctl pf enable|disable|reload|reload-blockips|flush-bruteforce|expire-bruteforce
+       fortressctl pf block <ip> | unblock <ip> [table]
+       fortressctl update all|dshield|emergingthreats|hosts|adblock2privoxy
+       fortressctl ab2p-reinit
+       fortressctl privoxy filtering-on|filtering-off|restart|clear-certs|expire-certs|config-test
+       fortressctl privoxy debug [1 1024 4096 8192 65536 ...]
+       fortressctl apache restart
+       fortressctl sysproxy on|off <network service>
+       fortressctl ca trust|untrust
+       fortressctl config-install <name> <file>
+USAGE
+	exit 2 ;;
+esac
